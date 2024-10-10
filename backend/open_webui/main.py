@@ -16,6 +16,11 @@ from typing import Optional
 import aiohttp
 import requests
 
+import firebase_admin
+from firebase_admin import credentials, auth as firebase_auth
+if not firebase_admin._apps:
+    cred = credentials.Certificate("./.secret-serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
 from open_webui.apps.ollama.main import (
     app as ollama_app,
     get_all_models as get_ollama_models,
@@ -2359,6 +2364,104 @@ async def oauth_callback(provider: str, request: Request, response: Response):
     redirect_url = f"{request.base_url}auth#token={jwt_token}"
     return RedirectResponse(url=redirect_url)
 
+
+@app.get("/oauth/firebase/authorize")
+async def firebase_authorize(request: Request, response: Response):
+    id_token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not id_token:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="No ID token provided")
+    try:
+        # Verify the Firebase ID token
+        user_data = firebase_auth.verify_id_token(id_token)
+    except Exception as e:
+        log.warning(f"Firebase ID token verification failed: {e}")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.INVALID_CRED)
+    # Extract user information from the token
+    sub = user_data.get("sub")
+    email = user_data.get("email", "").lower()
+    if not sub or not email:
+        log.warning(f"Missing 'sub' or 'email' from Firebase token: {user_data}")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.INVALID_CRED)
+    provider_sub = f"firebase@{sub}"
+    # Check if the user exists
+    user = Users.get_user_by_oauth_sub(provider_sub)
+    if not user:
+        # Try to merge account by email if merging is enabled
+        if OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value:
+            user = Users.get_user_by_email(email)
+            if user:
+                # Update user with the new OAuth provider_sub
+                Users.update_user_oauth_sub_by_id(user.id, provider_sub)
+    if not user:
+        # Handle new user signup if allowed
+        if True: #ENABLE_OAUTH_SIGNUP.value:
+            existing_user = Users.get_user_by_email(email)
+            if existing_user:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.EMAIL_TAKEN)
+
+            picture_url = user_data.get("picture", "")
+            if picture_url:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(picture_url) as resp:
+                            picture = await resp.read()
+                            base64_encoded_picture = base64.b64encode(picture).decode("utf-8")
+                            guessed_mime_type = mimetypes.guess_type(picture_url)[0] or "image/jpeg"
+                            picture_url = f"data:{guessed_mime_type};base64,{base64_encoded_picture}"
+                except Exception as e:
+                    log.error(f"Error downloading profile image '{picture_url}': {e}")
+                    picture_url = "/user.png"
+            else:
+                picture_url = "/user.png"
+
+            username = user_data.get("name", "User")
+            role = "admin" if Users.get_num_users() == 0 else webui_app.state.config.DEFAULT_USER_ROLE
+
+            user = Auths.insert_new_auth(
+                email=email,
+                password=get_password_hash(str(uuid.uuid4())),  # Random password
+                name=username,
+                profile_image_url=picture_url,
+                role=role,
+                oauth_sub=provider_sub,
+            )
+
+            if webui_app.state.config.WEBHOOK_URL:
+                post_webhook(
+                    webui_app.state.config.WEBHOOK_URL,
+                    WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                    {
+                        "action": "signup",
+                        "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                        "user": user.model_dump_json(exclude_none=True),
+                    },
+                )
+        else:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
+
+    # Create a JWT token for the user
+    jwt_token = create_token(
+        data={"id": user.id},
+        expires_delta=parse_duration(webui_app.state.config.JWT_EXPIRES_IN),
+    )
+
+    # Set the token as an HTTP-only cookie (optional)
+    response.set_cookie(
+        key="token",
+        value=jwt_token,
+        httponly=True,  # Ensures the token is not accessible via JavaScript
+    )
+
+    # Return the JSON response with the user information
+    return JSONResponse(content={
+        "token": jwt_token,
+        "token_type": "Bearer",
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "role": user.role,
+        "profile_image_url": user.profile_image_url,
+    })
 
 @app.get("/manifest.json")
 async def get_manifest_json():
